@@ -1,105 +1,101 @@
-import asyncio
-import io
-import nest_asyncio
-from PIL import Image
+import os
+import sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 import google.generativeai as genai
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
 
-nest_asyncio.apply()
+# Environment Variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-BOT_TOKEN = ""
-GEMINI_API_KEY = ""
+# ⚠️ O'zingizning Telegram ID-ingizni kiriting (@userinfobot orqali bilib olishingiz mumkin)
+ADMIN_ID = 1167476251  
 
-SYSTEM_PROMPT = """
-Sening isming - Zehno AI. Sen barcha fanlar bo'yicha maktab va universitet o'quvchilari uchun universal, mehribon va mahoratli Sokratik o'qituvchisiz.
-
-SENING ASOSIY MAQSADING:
-Murakkab va qiyin tuyulgan har qanday mavzu, formula, rasm, masala yoki hodisani O'QUVCHIGA JUDA SODDA, TUSHUNARLI VA HAYOTIY MISOL LAR BILAN TUSHUNTIRISH.
-
-O'QITISH QOIDALARI:
-1. UNIVERSALLIK:
-   - Matematika, Fizika, Kimyo, Biologiya, Tarix, Ona tili, Ingliz tili, Dasturlash va boshqa barcha fanlar bo'yicha birdek mukammal yordam ber.
-
-2. SODDALASHTIRISH VA HAYOTIY O'XSHATISHLAR:
-   - Har qanday murakkab tushunchani hayotiy sodda misollar bilan tushuntir.
-
-3. RASM BILAN ISHLASH (VISION):
-   - Agar o'quvchi rasm yuborsa (daftardagi misol, kitob sahifasi yoki sxema), rasmdagi matn va masalani aniq o'qi.
-   - HECH QACHON tayyor oxirgi javobni shartta berib qo'yma!
-   - Masala qayerida xatolik borligini yoki birinchi bo'lib qaysi qadamdan boshlash kerakligini ko'rsatib, yo'naltiruvchi savol ber.
-
-4. MOSLASHUVCHANLIK:
-   - O'quvchi "Tushunmadim" desa, tushuntirishni YANADA SODDALASHTIR va osonroq qadamlar ber.
-"""
-
+# AI va Botni sozlash
 genai.configure(api_key=GEMINI_API_KEY)
-
-model = genai.GenerativeModel(
-    model_name="gemini-3.6-flash",
-    system_instruction=SYSTEM_PROMPT
-)
-
+model = genai.GenerativeModel("gemini-1.5-flash")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-user_sessions = {}
 
-def get_user_chat(user_id: int):
-    if user_id not in user_sessions:
-        user_sessions[user_id] = model.start_chat(history=[])
-    return user_sessions[user_id]
+# SQLite Ma'lumotlar bazasini sozlash
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-@dp.message(CommandStart())
+# Foydalanuvchini bazaga qo'shish / Yangilash
+def add_or_update_user(user: types.User):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO users (user_id, username, first_name)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_active = CURRENT_TIMESTAMP
+    """, (user.id, user.username, user.first_name))
+    conn.commit()
+    conn.close()
+
+# /start komandasi
+@dp.message(Command("start"))
 async def start_handler(message: types.Message):
+    add_or_update_user(message.from_user)
     await message.answer(
-        f"Salom, {message.from_user.first_name}! 🧠 **Zehno AI**ga xush kelibsiz!\n\n"
-        "Menga matnli savol yuborishingiz yoki daftaringizdagi masala/misol rasmga olib yuborishingiz mumkin. Birgalikda oson va sodda qilib o'rganamiz!"
+        "Salom! Men Zehno AI sokratik repetitor botiman. Qanday savolingiz bor?"
     )
 
-# MATNLI XABARLAR UCHUN HANDLER
-@dp.message(F.text)
-async def handle_text(message: types.Message):
-    chat = get_user_chat(message.from_user.id)
-    for attempt in range(3):
-        try:
-            response = chat.send_message(message.text)
-            await message.answer(response.text)
-            return
-        except Exception as e:
-            if attempt == 2:
-                await message.answer("Serverda biroz uzilish bo'ldi, iltimos qayta yozing.")
-            else:
-                await asyncio.sleep(1)
+# /stat komandasi (Faqat Admin uchun)
+@dp.message(Command("stat"))
+async def stat_handler(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Admin bo'lmaganlarga javob qaytarilmaydi
 
-# RASMLI XABARLAR UCHUN HANDLER (VISION)
-@dp.message(F.photo)
-async def handle_photo(message: types.Message):
-    processing_msg = await message.answer("📷 Rasmni tahlil qilyapman, biroz kuting...")
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    
+    # Jami foydalanuvchilar soni
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    # Oxirgi 24 soat ichida faol bo'lganlar
+    cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now', '-1 day')")
+    active_24h = cursor.fetchone()[0]
+    
+    conn.close()
+
+    stat_text = (
+        "📊 **Zehno AI Bot Statistikasi:**\n\n"
+        f"👥 **Jami foydalanuvchilar:** {total_users} ta\n"
+        f"⚡ **Oxirgi 24 soatda faol:** {active_24h} ta"
+    )
+    await message.answer(stat_text, parse_mode="Markdown")
+
+# Barcha matnli xabarlarni AI ga yuborish
+@dp.message()
+async def ai_handler(message: types.Message):
+    add_or_update_user(message.from_user)
     try:
-        # Eng yuqori sifatli rasmni olish
-        photo = message.photo[-1]
-        photo_bytes = io.BytesIO()
-        await bot.download(photo, destination=photo_bytes)
-        photo_bytes.seek(0)
-        
-        # PIL orqali rasmni ochish
-        img = Image.open(photo_bytes)
-        
-        # Caption (rasm ostidagi matn) bo'lsa uni ham qo'shish
-        user_caption = message.caption if message.caption else "Ushbu rasmdagi masalani tushunishga yordam ber."
-        
-        chat = get_user_chat(message.from_user.id)
-        response = chat.send_message([user_caption, img])
-        
-        await processing_msg.delete()
+        response = model.generate_content(message.text)
         await message.answer(response.text)
     except Exception as e:
-        await processing_msg.delete()
-        await message.answer(f"Rasmni o'qishda xatolik bo'ldi: {e}")
+        await message.answer("Xatolik yuz berdi, qaytadan urinib ko'ring.")
 
 async def main():
-    print("Zehno AI Universal (Text + Vision) Bot ishga tushdi...")
+    init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
