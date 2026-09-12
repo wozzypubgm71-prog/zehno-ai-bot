@@ -1,19 +1,35 @@
 import os
 import sqlite3
-from aiogram import Bot, Dispatcher, types
+import asyncio
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 import google.generativeai as genai
+from PIL import Image
+import io
 
 # Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ⚠️ O'zingizning Telegram ID-ingizni kiriting (@userinfobot orqali bilib olishingiz mumkin)
+# ⚠️ O'zingizning Telegram ID-ingiz (Rasmda ko'ringan ID: 1167476251)
 ADMIN_ID = 1167476251  
 
-# AI va Botni sozlash
+# Gemini AI sozlamasi
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Sokratik Repetitor Prompti
+SYSTEM_PROMPT = (
+    "Siz Zehno AI - sokratik usulda dars beruvchi intellektual repetitorsiz. "
+    "Foydalanuvchiga hech qachon to'g'ridan-to me'yoriy tayyor javobni bermang! "
+    "Buning o'rniga qisqa, yo'naltiruvchi savollar berib, uni mustaqil fikrlashga va javobni o'zi topishiga undang. "
+    "Muloqot tili: O'zbek tili."
+)
+
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    system_instruction=SYSTEM_PROMPT
+)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -35,44 +51,42 @@ def init_db():
 
 # Foydalanuvchini bazaga qo'shish / Yangilash
 def add_or_update_user(user: types.User):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO users (user_id, username, first_name)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name,
-            last_active = CURRENT_TIMESTAMP
-    """, (user.id, user.username, user.first_name))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect("bot_database.db")
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO users (user_id, username, first_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_active = CURRENT_TIMESTAMP
+        """, (user.id, user.username, user.first_name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB Error: {e}")
 
 # /start komandasi
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     add_or_update_user(message.from_user)
     await message.answer(
-        "Salom! Men Zehno AI sokratik repetitor botiman. Qanday savolingiz bor?"
+        "Salom! Men Zehno AI botiman. Qanday savolingiz yoki misolingiz bor? Yoki rasmga olib yuboring!"
     )
 
 # /stat komandasi (Faqat Admin uchun)
 @dp.message(Command("stat"))
 async def stat_handler(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        return  # Admin bo'lmaganlarga javob qaytarilmaydi
+        return
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-    
-    # Jami foydalanuvchilar soni
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
-    
-    # Oxirgi 24 soat ichida faol bo'lganlar
     cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now', '-1 day')")
     active_24h = cursor.fetchone()[0]
-    
     conn.close()
 
     stat_text = (
@@ -82,7 +96,25 @@ async def stat_handler(message: types.Message):
     )
     await message.answer(stat_text, parse_mode="Markdown")
 
-# Barcha matnli xabarlarni AI ga yuborish
+# Rasmli xabarlarni tahlil qilish
+@dp.message(F.photo)
+async def photo_handler(message: types.Message):
+    add_or_update_user(message.from_user)
+    try:
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        photo_bytes = await bot.download_file(file_info.file_path)
+        
+        image = Image.open(io.BytesIO(photo_bytes.read()))
+        caption = message.caption if message.caption else "Ushbu rasmdagi masalani/savolni tahlil qilib, menga sokratik usulda yordam ber."
+        
+        response = model.generate_content([caption, image])
+        await message.answer(response.text)
+    except Exception as e:
+        print(f"Error handling photo: {e}")
+        await message.answer("Rasmni o'qishda xatolik yuz berdi. Iltimos, qaytadan aniqroq tushirib yuboring.")
+
+# Matnli xabarlarni AI ga yuborish
 @dp.message()
 async def ai_handler(message: types.Message):
     add_or_update_user(message.from_user)
@@ -90,12 +122,12 @@ async def ai_handler(message: types.Message):
         response = model.generate_content(message.text)
         await message.answer(response.text)
     except Exception as e:
-        await message.answer("Xatolik yuz berdi, qaytadan urinib ko'ring.")
+        print(f"Error in Gemini: {e}")
+        await message.answer("Ayni vaqtda xatolik yuz berdi, iltimos birozdan so'ng qayta urinib ko'ring.")
 
 async def main():
     init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
